@@ -3,7 +3,7 @@
  *
  *  This program can be used and distributed without restrictions.
  *
- *      This program is provided with the V4L2 API
+ * This program is based on the examples provided with the V4L2 API
  * see https://linuxtv.org/docs.php for more information
  */
 
