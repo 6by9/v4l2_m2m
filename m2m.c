@@ -481,7 +481,9 @@ static void init_device_out(void)
         CLEAR(fmt);
 
         fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-        if (force_format) {
+        if (-1 == xioctl(fd, VIDIOC_G_FMT, &fmt))
+                errno_exit("VIDIOC_G_FMT");
+        if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_H264 && force_format) {
                 fmt.fmt.pix.width       = 1920;
                 fmt.fmt.pix.height      = 1080;
                 fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
@@ -491,10 +493,6 @@ static void init_device_out(void)
                         errno_exit("VIDIOC_S_FMT");
 
                 /* Note VIDIOC_S_FMT may change width and height. */
-        } else {
-                /* Preserve original settings as set by v4l2-ctl for example */
-                if (-1 == xioctl(fd, VIDIOC_G_FMT, &fmt))
-                        errno_exit("VIDIOC_G_FMT");
         }
 
         /* Buggy driver paranoia. */
@@ -620,20 +618,18 @@ V4L2_CAP_DEVICE_CAPS
         CLEAR(fmt);
 
         fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        if (force_format) {
+        if (-1 == xioctl(fd, VIDIOC_G_FMT, &fmt))
+                errno_exit("VIDIOC_G_FMT");
+        if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_H264 && force_format) {
                 fmt.fmt.pix.width       = 640;
                 fmt.fmt.pix.height      = 480;
-                fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
-                fmt.fmt.pix.field       = V4L2_FIELD_INTERLACED;
+                fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
+                fmt.fmt.pix.field       = V4L2_FIELD_NONE;
 
                 if (-1 == xioctl(fd, VIDIOC_S_FMT, &fmt))
                         errno_exit("VIDIOC_S_FMT");
 
                 /* Note VIDIOC_S_FMT may change width and height. */
-        } else {
-                /* Preserve original settings as set by v4l2-ctl for example */
-                if (-1 == xioctl(fd, VIDIOC_G_FMT, &fmt))
-                        errno_exit("VIDIOC_G_FMT");
         }
 
         /* Buggy driver paranoia. */
