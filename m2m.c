@@ -27,6 +27,109 @@
 
 #define CLEAR(x) memset(&(x), 0, sizeof(x))
 
+int offset = 0;
+int table = 0;
+int local_timestamp = 0;
+#define PTS_INCREMENT 33000
+#define RUN         0
+#define FLUSH       1
+#define GO          2
+int state = RUN;
+
+int packet_offsets[2][100] = {
+{
+0
+,2928
+,3058
+,3190
+,94140
+,193830
+,240684
+,266466
+,299695
+,304150
+,334384
+,336893
+,362239
+,370558
+,401016
+,405192
+,436897
+,443832
+,477453
+,486249
+,518586
+,527914
+,562729
+,575269
+,602214
+,645399
+,684072
+,692153
+,724073
+,732558
+,764008
+,768937
+,802554
+,810132
+,845396
+,858882
+,902090
+,911961
+,951252
+,964217
+,1004053
+,1015675
+    },
+    {
+18000292
+,18313990
+,18384817
+,18404233
+,18493958
+,18516365
+,18607460
+,18630164
+,18724823
+,18748020
+,18843583
+,18866000
+,18961828
+,18983634
+,19079408
+,19101591
+,19197454
+,19220470
+,19318121
+,19341377
+,19417004
+,19442577
+,19529032
+,19544161
+,19587031
+,19871145
+,19938227
+,19951616
+,20037228
+,20052848
+,20140831
+,20156112
+,20247307
+,20263584
+,20354642
+,20371797
+,20461408
+,20477712
+,20566823
+,20583325
+,20671778
+,20687956
+
+    }
+};
+
+
+
 enum io_method {
         IO_METHOD_READ,
         IO_METHOD_MMAP,
@@ -36,6 +139,7 @@ enum io_method {
 struct buffer {
         void   *start;
         size_t  length;
+        struct v4l2_plane planes[VIDEO_MAX_PLANES];
 };
 
 static char            *dev_name;
@@ -52,6 +156,8 @@ static int              force_format;
 static int              frame_count = 70;
 static char            *in_filename;
 static FILE            *in_fp;
+
+static void stop_capture(enum v4l2_buf_type type);
 
 static void errno_exit(const char *s)
 {
@@ -70,27 +176,67 @@ static int xioctl(int fh, int request, void *arg)
         return r;
 }
 
-static void process_image(const void *p, int size)
+static void process_image(struct buffer *buf, struct v4l2_buffer *v4l2_buf)
 {
+        void *p = buf->start;
+        int size = buf->length;
+
         if (!out_fp)
                 out_fp = fopen(out_filename, "wb");
         if (out_fp)
                 fwrite(p, size, 1, out_fp);
 
         fflush(stderr);
-        fprintf(stderr, ".");
+        fprintf(stderr, "\t\tDecoded PTS %lu.%06lu\n", v4l2_buf->timestamp.tv_sec, v4l2_buf->timestamp.tv_usec);
 }
 
-static void supply_input(void *buf, unsigned int buf_len, unsigned int *bytesused)
+static void supply_input(void *buf, struct v4l2_buffer *v4l2_buf)
 {
     unsigned char *buf_char = (unsigned char*)buf;
+    unsigned int read_len;
+    unsigned int bytesused;
+
     if (in_fp) {
-        *bytesused = fread(buf, 1, buf_len, in_fp);
-        if (*bytesused != buf_len)
-            fprintf(stderr, "Short read %u instead of %u\n", *bytesused, buf_len);
-        else
-            fprintf(stderr, "Read %u bytes. First 4 bytes %02x %02x %02x %02x\n", *bytesused, 
-                buf_char[0], buf_char[1], buf_char[2], buf_char[3]);
+        if (!packet_offsets[table][offset+1]) {
+            enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+
+            fprintf(stderr, "Got to the end of our little list - offset %u - jump table \n",
+                        offset);
+            offset = 0;
+            table = 1;
+            local_timestamp += PTS_INCREMENT*100;
+
+            fseek(in_fp, packet_offsets[table][offset], SEEK_SET);
+            stop_capture(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
+            if (-1 == xioctl(fd, VIDIOC_STREAMON, &type))
+                errno_exit("VIDIOC_STREAMON");
+
+        }
+
+        read_len = packet_offsets[table][offset+1] - packet_offsets[table][offset];
+        offset++;
+        v4l2_buf->timestamp.tv_sec = local_timestamp / 1000000;
+        v4l2_buf->timestamp.tv_usec = local_timestamp % 1000000;
+
+        local_timestamp += PTS_INCREMENT;
+
+        if (read_len > v4l2_buf->m.planes[0].length) {
+            fprintf(stderr, "Packet bigger than the buffer - offset %u, len %u\n",
+                    offset-1, read_len);
+            read_len = v4l2_buf->m.planes[0].length;
+        }
+
+        bytesused = fread(buf, 1, read_len, in_fp);
+        if (bytesused != read_len)
+            fprintf(stderr, "Short read %u instead of %u\n", bytesused, read_len);
+        //else
+        //    fprintf(stderr, "Read %u bytes. First 4 bytes %02x %02x %02x %02x\n", bytesused,
+        //        buf_char[0], buf_char[1], buf_char[2], buf_char[3]);
+
+        v4l2_buf->m.planes[0].bytesused = bytesused;
+        //fprintf(stderr, "Buffer starts %02x %02x %02x %02x %02x, length %u",
+        //    buf_char[0], buf_char[1], buf_char[2], buf_char[3], buf_char[4], bytesused);
+        fprintf(stderr, "\tSubmit PTS of %lu.%06lu\n", v4l2_buf->timestamp.tv_sec, v4l2_buf->timestamp.tv_usec);
     }
 }
 
@@ -116,7 +262,7 @@ static int read_frame(enum v4l2_buf_type type, struct buffer *bufs, unsigned int
                         }
                 }
 
-                process_image(bufs[0].start, bufs[0].length);
+                process_image(&bufs[0], &buf);//bufs[0].start, bufs[0].length);
                 break;
 
         case IO_METHOD_MMAP:
@@ -124,6 +270,8 @@ static int read_frame(enum v4l2_buf_type type, struct buffer *bufs, unsigned int
 
                 buf.type = type;
                 buf.memory = V4L2_MEMORY_MMAP;
+                buf.length = VIDEO_MAX_PLANES;
+                buf.m.planes = bufs[buf.index].planes;
 
                 if (-1 == xioctl(fd, VIDIOC_DQBUF, &buf)) {
                         switch (errno) {
@@ -142,10 +290,10 @@ static int read_frame(enum v4l2_buf_type type, struct buffer *bufs, unsigned int
 
                 assert(buf.index < n_buffers);
 
-                if (type == V4L2_BUF_TYPE_VIDEO_CAPTURE)
-                    process_image(bufs[buf.index].start, buf.bytesused);
+                if (type == V4L2_BUF_TYPE_VIDEO_CAPTURE || type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
+                    process_image(&bufs[buf.index], &buf);
                 else
-                    supply_input(bufs[buf.index].start, bufs[buf.index].length, &buf.bytesused);
+                    supply_input(bufs[buf.index].start, &buf);
 
                 if (-1 == xioctl(fd, VIDIOC_QBUF, &buf))
                         errno_exit("VIDIOC_QBUF");
@@ -179,7 +327,7 @@ static int read_frame(enum v4l2_buf_type type, struct buffer *bufs, unsigned int
 
                 assert(i < n_buffers);
 
-                process_image((void *)buf.m.userptr, buf.bytesused);
+                process_image(&bufs[i], &buf); //(void *)buf.m.userptr, buf.bytesused);
 
                 if (-1 == xioctl(fd, VIDIOC_QBUF, &buf))
                         errno_exit("VIDIOC_QBUF");
@@ -205,10 +353,10 @@ static void stop_capturing(void)
 
         case IO_METHOD_MMAP:
         case IO_METHOD_USERPTR:
-                stop_capture(V4L2_BUF_TYPE_VIDEO_CAPTURE);
+                stop_capture(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
 
                 if (m2m_enabled) 
-                    stop_capture(V4L2_BUF_TYPE_VIDEO_OUTPUT);
+                    stop_capture(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
                 break;
         }
 }
@@ -224,9 +372,11 @@ static void start_capturing_mmap(enum v4l2_buf_type type, struct buffer *bufs, u
         buf.type = type;
         buf.memory = V4L2_MEMORY_MMAP;
         buf.index = i;
+        buf.length = VIDEO_MAX_PLANES;
+        buf.m.planes = bufs[buf.index].planes;
 
-        if (type == V4L2_BUF_TYPE_VIDEO_OUTPUT)
-            supply_input(bufs[i].start, bufs[i].length, &buf.bytesused);
+        if (type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
+            supply_input(bufs[i].start, &buf);
 
         if (-1 == xioctl(fd, VIDIOC_QBUF, &buf))
                 errno_exit("VIDIOC_QBUF");
@@ -247,9 +397,9 @@ static void start_capturing(void)
                 break;
 
         case IO_METHOD_MMAP:
-                start_capturing_mmap(V4L2_BUF_TYPE_VIDEO_CAPTURE, buffers, n_buffers);
+                start_capturing_mmap(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, buffers, n_buffers);
                 if (m2m_enabled)
-                    start_capturing_mmap(V4L2_BUF_TYPE_VIDEO_OUTPUT, buffers_out, n_buffers_out);
+                    start_capturing_mmap(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, buffers_out, n_buffers_out);
                 break;
 
         case IO_METHOD_USERPTR:
@@ -257,7 +407,7 @@ static void start_capturing(void)
                         struct v4l2_buffer buf;
 
                         CLEAR(buf);
-                        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
                         buf.memory = V4L2_MEMORY_USERPTR;
                         buf.index = i;
                         buf.m.userptr = (unsigned long)buffers[i].start;
@@ -266,7 +416,7 @@ static void start_capturing(void)
                         if (-1 == xioctl(fd, VIDIOC_QBUF, &buf))
                                 errno_exit("VIDIOC_QBUF");
                 }
-                type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
                 if (-1 == xioctl(fd, VIDIOC_STREAMON, &type))
                         errno_exit("VIDIOC_STREAMON");
                 break;
@@ -313,10 +463,10 @@ static void uninit_device(void)
 
         case IO_METHOD_MMAP:
                 unmap_buffers(buffers, n_buffers);
-                free_buffers_mmap(V4L2_BUF_TYPE_VIDEO_CAPTURE);
+                free_buffers_mmap(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
                 if (m2m_enabled) {
                     unmap_buffers(buffers_out, n_buffers_out);
-                    free_buffers_mmap(V4L2_BUF_TYPE_VIDEO_OUTPUT);
+                    free_buffers_mmap(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
                 }
                 break;
 
@@ -390,18 +540,20 @@ static void init_mmap(enum v4l2_buf_type type, struct buffer **bufs_out, unsigne
                 buf.type        = type;
                 buf.memory      = V4L2_MEMORY_MMAP;
                 buf.index       = n;
+                buf.length = VIDEO_MAX_PLANES;
+                buf.m.planes = bufs[n].planes;
 
                 if (-1 == xioctl(fd, VIDIOC_QUERYBUF, &buf))
                         errno_exit("VIDIOC_QUERYBUF");
 
                 fprintf(stderr, "Mapping buffer %u, len %u\n", n, buf.length);
-                bufs[n].length = buf.length;
+                bufs[n].length = bufs[n].planes[0].length; //buf.length;
                 bufs[n].start =
                         mmap(NULL /* start anywhere */,
-                              buf.length,
+                              bufs[n].length,
                               PROT_READ | PROT_WRITE /* required */,
                               MAP_SHARED /* recommended */,
-                              fd, buf.m.offset);
+                              fd, bufs[n].planes[0].m.mem_offset /*buf.m.offset*/);
 
                 if (MAP_FAILED == bufs[n].start)
                         errno_exit("mmap");
@@ -457,10 +609,10 @@ static void init_device_out(void)
 
         CLEAR(cropcap);
 
-        cropcap.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+        cropcap.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
 
         if (0 == xioctl(fd, VIDIOC_CROPCAP, &cropcap)) {
-                crop.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                crop.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
                 crop.c = cropcap.defrect; /* reset to default */
 
                 if (-1 == xioctl(fd, VIDIOC_S_CROP, &crop)) {
@@ -480,13 +632,13 @@ static void init_device_out(void)
 
         CLEAR(fmt);
 
-        fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+        fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
         if (-1 == xioctl(fd, VIDIOC_G_FMT, &fmt))
                 errno_exit("VIDIOC_G_FMT");
-        if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_H264 && force_format) {
-                fmt.fmt.pix.width       = 1920;
-                fmt.fmt.pix.height      = 1080;
-                fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
+        if (1 /*fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_H264 && force_format*/) {
+                fmt.fmt.pix.width       = 1280;
+                fmt.fmt.pix.height      = 720;
+                fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_H264;
                 fmt.fmt.pix.field       = V4L2_FIELD_NONE;
 
                 if (-1 == xioctl(fd, VIDIOC_S_FMT, &fmt))
@@ -509,7 +661,7 @@ static void init_device_out(void)
                 break;
 
         case IO_METHOD_MMAP:
-                init_mmap(V4L2_BUF_TYPE_VIDEO_OUTPUT, &buffers_out, &n_buffers_out);
+                init_mmap(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, &buffers_out, &n_buffers_out);
                 break;
 
         case IO_METHOD_USERPTR:
@@ -556,14 +708,14 @@ V4L2_CAP_STREAMING
 V4L2_CAP_DEVICE_CAPS
 
 bcm2835-codec
-8420 8000
+8420 4000
 V4L2_CAP_VIDEO_M2M
 V4L2_CAP_EXT_PIX_FORMAT
 V4L2_CAP_STREAMING
 V4L2_CAP_DEVICE_CAPS
 */
         fprintf(stderr, "caps returned %04x\n", cap.capabilities);
-        if (!(cap.capabilities & (V4L2_CAP_VIDEO_M2M|V4L2_CAP_VIDEO_CAPTURE))) {
+        if (!(cap.capabilities & (V4L2_CAP_VIDEO_M2M_MPLANE|V4L2_CAP_VIDEO_CAPTURE|V4L2_CAP_VIDEO_CAPTURE_MPLANE))) {
                 fprintf(stderr, "%s is no video capture device\n",
                          dev_name);
                 exit(EXIT_FAILURE);
@@ -594,10 +746,10 @@ V4L2_CAP_DEVICE_CAPS
 
         CLEAR(cropcap);
 
-        cropcap.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        cropcap.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 
         if (0 == xioctl(fd, VIDIOC_CROPCAP, &cropcap)) {
-                crop.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                crop.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
                 crop.c = cropcap.defrect; /* reset to default */
 
                 if (-1 == xioctl(fd, VIDIOC_S_CROP, &crop)) {
@@ -617,12 +769,12 @@ V4L2_CAP_DEVICE_CAPS
 
         CLEAR(fmt);
 
-        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         if (-1 == xioctl(fd, VIDIOC_G_FMT, &fmt))
                 errno_exit("VIDIOC_G_FMT");
-        if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_H264 && force_format) {
-                fmt.fmt.pix.width       = 640;
-                fmt.fmt.pix.height      = 480;
+        if (1 /*fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_YUV420 && force_format*/) {
+                fmt.fmt.pix.width       = 1280;
+                fmt.fmt.pix.height      = 720;
                 fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
                 fmt.fmt.pix.field       = V4L2_FIELD_NONE;
 
@@ -646,14 +798,14 @@ V4L2_CAP_DEVICE_CAPS
                 break;
 
         case IO_METHOD_MMAP:
-                init_mmap(V4L2_BUF_TYPE_VIDEO_CAPTURE, &buffers, &n_buffers);
+                init_mmap(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, &buffers, &n_buffers);
                 break;
 
         case IO_METHOD_USERPTR:
                 init_userp(fmt.fmt.pix.sizeimage);
                 break;
         }
-        if (cap.capabilities & V4L2_CAP_VIDEO_M2M) {
+        if (cap.capabilities & (V4L2_CAP_VIDEO_M2M | V4L2_CAP_VIDEO_M2M_MPLANE)) {
             init_device_out();
             m2m_enabled = 1;
             if (in_filename) {
@@ -705,15 +857,15 @@ static void handle_event(void)
             case V4L2_EVENT_SOURCE_CHANGE:
                 fprintf(stderr, "Source changed\n");
 
-                stop_capture(V4L2_BUF_TYPE_VIDEO_CAPTURE);
+                stop_capture(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
                 unmap_buffers(buffers, n_buffers);
 
                 fprintf(stderr, "Unmapped all buffers\n");
-                free_buffers_mmap(V4L2_BUF_TYPE_VIDEO_CAPTURE);
+                free_buffers_mmap(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
 
-                init_mmap(V4L2_BUF_TYPE_VIDEO_CAPTURE, &buffers, &n_buffers);
+                init_mmap(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, &buffers, &n_buffers);
 
-                start_capturing_mmap(V4L2_BUF_TYPE_VIDEO_CAPTURE, buffers, n_buffers);
+                start_capturing_mmap(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, buffers, n_buffers);
                 break;
             case V4L2_EVENT_EOS:
                 fprintf(stderr, "EOS\n");
@@ -754,7 +906,7 @@ static void mainloop(void)
                         }
 
                         /* Timeout. */
-                        tv.tv_sec = 10;
+                        tv.tv_sec = 30;
                         tv.tv_usec = 0;
 
                         r = select(fd + 1, rd_fds, wr_fds, ex_fds, &tv);
@@ -771,17 +923,17 @@ static void mainloop(void)
                         }
 
                         if (rd_fds && FD_ISSET(fd, rd_fds)) {
-                            fprintf(stderr, "Reading\n");
-                            if (read_frame(V4L2_BUF_TYPE_VIDEO_CAPTURE, buffers, n_buffers))
+                            //fprintf(stderr, "Reading\n");
+                            if (read_frame(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, buffers, n_buffers))
                                 break;
                         }
                         if (wr_fds && FD_ISSET(fd, wr_fds)) {
-                            fprintf(stderr, "Writing\n");
-                            if (read_frame(V4L2_BUF_TYPE_VIDEO_OUTPUT, buffers_out, n_buffers_out))
+                            //fprintf(stderr, "Writing\n");
+                            if (read_frame(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, buffers_out, n_buffers_out))
                                 break;
                         }
                         if (ex_fds && FD_ISSET(fd, ex_fds)) {
-                            fprintf(stderr, "Exception\n");
+                            //fprintf(stderr, "Exception\n");
                             handle_event();
                         }
                         /* EAGAIN - continue select loop. */
@@ -826,7 +978,7 @@ long_options[] = {
 
 int main(int argc, char **argv)
 {
-        dev_name = "/dev/video0";
+        dev_name = "/dev/video10";
 
         for (;;) {
                 int idx;
